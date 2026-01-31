@@ -1,0 +1,14 @@
+# Porcupine 챗봇 (WM8960 + LCD)
+# 상위 폴더(pi_ai)에 API 키 파일 필요: OpenAI_API_Key.txt, tavily_API_key.txt, picovoice_API_Key.txt
+
+openai>=1.0.0
+tavily-python
+pvporcupine
+pyaudio
+numpy
+Pillow
+
+# Raspberry Pi 전용 (LCD/GPIO) - Pi에서만 설치
+# RPi.GPIO
+# spidev
+# (시스템 패키지: sudo apt install python3-rpi.gpio python3-spidev)
