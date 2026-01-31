@@ -68,7 +68,12 @@ MIC_SOFTWARE_GAIN = 2.5        # 마이크 소프트웨어 증폭 (1.0=없음)
 # 녹음 전 버퍼 비우기 (이전 데이터가 다음 질문에 섞이는 것 방지)
 FLUSH_SEC_AFTER_TRIGGER = 0.25  # 트리거 후 버릴 시간(초). 짧을수록 대화 간격 단축
 COOLDOWN_SEC_AFTER_RESPONSE = 0.5  # 응답 끝난 뒤 Porcupine 무시 시간(초). 짧을수록 다음 호출 빠름
-RECORD_SEC = 3  # 질문 녹음 길이(초). 3~4 권장. 짧으면 대화 간격 단축
+RECORD_SEC = 3  # (VAD 미사용 시) 고정 녹음 길이(초). VAD 사용 시에는 참고만
+# VAD (에너지 기반): 침묵이면 녹음 중지
+MAX_RECORD_SEC = 15              # 최대 질문 길이(초)
+VAD_SILENCE_SEC = 3              # 음성 없는 구간이 이 시간 이상이면 녹음 중지
+VAD_CHUNK_SEC = 0.2               # 에너지 계산 구간(초)
+VAD_THRESHOLD = 900               # 구간 평균 에너지가 이 값 넘으면 '말 있음' (0~32768)
 # 키워드 인식 시 음성으로 응답할 문장 (TTS 재생 후 녹음 시작)
 KEYWORD_ACK_PHRASE = "어 말해봐"
 # 노이즈를 음성으로 인식하지 않도록 (0~32768)
@@ -242,6 +247,9 @@ def _play_keyword_ack_and_start_listening() -> None:
     finally:
         shared_state["status"] = "LISTENING"
         shared_state["text"] = "네, 말씀하세요!"
+        shared_state["vad_speech_seen"] = False
+        shared_state["vad_silence_frames"] = 0
+        shared_state["vad_last_checked"] = 0
 
 
 # ==================== AI (porcupine.py 동일) ====================
@@ -415,13 +423,40 @@ def audio_loop() -> None:
                 pass
 
             elif shared_state["status"] == "LISTENING":
-                # test_record.py와 동일: 원본만 저장 (증폭 없음, 클리핑 방지)
+                # test_record.py와 동일: 원본만 저장 (증폭 없음)
                 frames.append(pcm)
-                required = int(porcupine.sample_rate / porcupine.frame_length * RECORD_SEC)
-                if len(frames) >= required:
+                raw = np.frombuffer(b"".join(frames), dtype=np.int16)
+                total_samples = len(raw)
+                total_sec = total_samples / porcupine.sample_rate
+                should_stop = False
+
+                # 1) 최대 15초 도달 시 중지
+                if total_sec >= MAX_RECORD_SEC:
+                    should_stop = True
+                    log("✅ 녹음 최대 길이(15초) 도달 -> AI 처리")
+                else:
+                    # 2) VAD: 구간별 에너지로 침묵 3초 이상이면 중지
+                    samples_per_vad_chunk = int(porcupine.sample_rate * VAD_CHUNK_SEC)
+                    silence_chunks_required = int(VAD_SILENCE_SEC / VAD_CHUNK_SEC)
+                    last_checked = shared_state.get("vad_last_checked", 0)
+                    while last_checked + samples_per_vad_chunk <= total_samples:
+                        chunk = raw[last_checked : last_checked + samples_per_vad_chunk]
+                        energy = np.abs(chunk).mean()
+                        if energy >= VAD_THRESHOLD:
+                            shared_state["vad_speech_seen"] = True
+                            shared_state["vad_silence_frames"] = 0
+                        else:
+                            shared_state["vad_silence_frames"] = shared_state.get("vad_silence_frames", 0) + 1
+                        last_checked += samples_per_vad_chunk
+                    shared_state["vad_last_checked"] = last_checked
+
+                    if shared_state.get("vad_speech_seen") and shared_state.get("vad_silence_frames", 0) >= silence_chunks_required:
+                        should_stop = True
+                        log("✅ 침묵 3초 이상 -> 녹음 중지, AI 처리")
+
+                if should_stop:
                     raw = np.frombuffer(b"".join(frames), dtype=np.int16)
                     level = np.abs(raw).mean()
-                    # 구간별 레벨: 노이즈만 있으면 대부분 구간이 낮고, 말이 있으면 여러 구간이 높음
                     samples_per_chunk = int(porcupine.sample_rate * CHUNK_SEC)
                     n_chunks = max(1, len(raw) // samples_per_chunk)
                     chunks_above = 0
@@ -447,6 +482,7 @@ def audio_loop() -> None:
                         threading.Thread(target=ai_worker, args=(wav_path,), daemon=True).start()
                         shared_state["status"] = "THINKING"
                         shared_state["text"] = "처리 중..."
+                    frames = []
         except Exception:
             pass
 
