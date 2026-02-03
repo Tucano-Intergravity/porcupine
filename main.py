@@ -63,7 +63,7 @@ TAVILY_API_KEY = load_api_key("tavily_API_key.txt", "tvly-...")
 PICOVOICE_KEY = load_api_key("picovoice_API_Key.txt", "...")
 
 # 키워드 인식 조정 (필요 시 수정)
-PORCUPINE_SENSITIVITY = 0.5    # 0~1, 제조사 권장 기본값
+PORCUPINE_SENSITIVITY = 0.8    # 0~1, 제조사 권장 기본값 0.5 → 인식률 개선 위해 0.8
 MIC_SOFTWARE_GAIN = 2.5        # 마이크 소프트웨어 증폭 (1.0=없음)
 # 녹음 전 버퍼 비우기 (이전 데이터가 다음 질문에 섞이는 것 방지)
 FLUSH_SEC_AFTER_TRIGGER = 0.25  # 트리거 후 버릴 시간(초). 짧을수록 대화 간격 단축
@@ -156,9 +156,9 @@ def setup_wm8960_mixer(card_id: int) -> None:
     _amixer_set(card_id, "Mono Output Mixer Left", "on")
     _amixer_set(card_id, "Mono Output Mixer Right", "on")
 
-    # --- 재생 볼륨 (스피커 80%) ---
-    _amixer_set(card_id, "Speaker", "80%")
-    _amixer_set(card_id, "Speaker Playback Volume", "80%")
+    # --- 재생 볼륨 (스피커 90%) ---
+    _amixer_set(card_id, "Speaker", "90%")
+    _amixer_set(card_id, "Speaker Playback Volume", "90%")
     _amixer_set(card_id, "Headphone", "100%")
     _amixer_set(card_id, "Headphone Playback Volume", "100%")
     _amixer_set(card_id, "Playback", "100%")
@@ -170,11 +170,11 @@ def setup_wm8960_mixer(card_id: int) -> None:
 
     # --- 캡처/마이크 감도 최대 (Porcupine 키워드 인식용) ---
     _amixer_set(card_id, "Capture", "100%")
-    _amixer_set(card_id, "Capture Volume", "80%")
+    _amixer_set(card_id, "Capture Volume", "90%")
     _amixer_set(card_id, "ADC PCM Capture Volume", "80%")
-    # LINPUT1/RINPUT1 마이크 부스트 (범위 0~3, 1=클리핑 방지)
-    _amixer_set(card_id, "Left Input Boost Mixer LINPUT1 Volume", "1")
-    _amixer_set(card_id, "Right Input Boost Mixer RINPUT1 Volume", "1")
+    # LINPUT1/RINPUT1 마이크 부스트 (범위 0~3, 3=최대)
+    _amixer_set(card_id, "Left Input Boost Mixer LINPUT1 Volume", "3")
+    _amixer_set(card_id, "Right Input Boost Mixer RINPUT1 Volume", "3")
 
     log("WM8960 믹서 설정 완료 (재생·마이크 최대).")
 
@@ -305,14 +305,26 @@ def ai_worker(filename: str) -> None:
 
         if msg.tool_calls:
             shared_state["text"] = "🌐 검색 중..."
+            # assistant 메시지는 한 번만 추가 (tool_calls 포함)
+            assistant_msg = {
+                "role": "assistant",
+                "content": msg.content or None,
+                "tool_calls": [
+                    {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in msg.tool_calls
+                ],
+            }
+            msgs.append(assistant_msg)
+            # 각 tool_call_id에 대해 tool 메시지를 순서대로 추가 (전부 있어야 API 오류 없음)
             for tc in msg.tool_calls:
-                if tc.function.name == "web_search":
-                    arg = json.loads(tc.function.arguments)
+                if getattr(tc.function, "name", None) == "web_search":
+                    arg = json.loads(tc.function.arguments or "{}")
                     search_res = web_search(arg.get("query", ""))
-                    msgs.append(msg)
-                    msgs.append({"tool_call_id": tc.id, "role": "tool", "name": "web_search", "content": search_res})
+                else:
+                    search_res = json.dumps({"error": "unknown tool"})
+                msgs.append({"role": "tool", "tool_call_id": tc.id, "name": tc.function.name, "content": search_res})
             final = client.chat.completions.create(model="gpt-4o", messages=msgs)
-            reply = final.choices[0].message.content
+            reply = final.choices[0].message.content or ""
         else:
             reply = msg.content
 
@@ -567,11 +579,36 @@ def lcd_set_window(spi, dc_pin: int, x0: int, y0: int, x1: int, y1: int) -> None
 def rgb565(r: int, g: int, b: int) -> int:
     return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
 
+# 글자마다 다른 색 (RGB). 인덱스로 순환 사용
+LCD_CHAR_COLORS = [
+    (255, 100, 100), (100, 255, 255), (255, 255, 100), (150, 255, 150),
+    (255, 200, 150), (200, 150, 255), (100, 255, 200), (255, 150, 200),
+    (200, 255, 100), (100, 200, 255), (255, 180, 100), (180, 255, 180),
+]
+
+def _char_width(draw, char: str, font) -> int:
+    """한 글자 너비 픽셀"""
+    try:
+        bbox = draw.textbbox((0, 0), char, font=font)
+        return max(bbox[2] - bbox[0], 1)
+    except Exception:
+        return 10
+
+def draw_text_each_char_color(draw, x: int, y: int, s: str, font, color_index: int = 0) -> int:
+    """문자열 s를 글자마다 다른 색으로 그리며 x 진행. 반환: 그린 뒤 x 위치."""
+    for i, c in enumerate(s):
+        color = LCD_CHAR_COLORS[(color_index + i) % len(LCD_CHAR_COLORS)]
+        draw.text((x, y), c, fill=color, font=font)
+        x += _char_width(draw, c, font)
+    return x
+
 def lcd_draw_image(spi, dc_pin: int, img: Image.Image) -> None:
     if not LCD_AVAILABLE:
         return
     if img.size != (LCD_WIDTH, LCD_HEIGHT):
         img = img.resize((LCD_WIDTH, LCD_HEIGHT), Image.LANCZOS)
+    # LCD가 180도 뒤집혀 장착된 경우 회전 (화면이 정상 방향으로 보이도록)
+    img = img.transpose(Image.ROTATE_180)
     pixel_data = []
     for y in range(LCD_HEIGHT):
         for x in range(LCD_WIDTH):
@@ -582,6 +619,25 @@ def lcd_draw_image(spi, dc_pin: int, img: Image.Image) -> None:
     GPIO.output(dc_pin, GPIO.HIGH)
     for i in range(0, len(pixel_data), 4096):
         spi.xfer(pixel_data[i : i + 4096])
+
+def lcd_show_title(spi, dc_pin: int) -> None:
+    """LCD에 'PORCUPINE' / 'PROJECT' 두 줄로 고정 표시 (초기화 직후용)"""
+    if not LCD_AVAILABLE or spi is None:
+        return
+    img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), color=(10, 10, 20))
+    draw = ImageDraw.Draw(img)
+    try:
+        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+    except Exception:
+        font_large = ImageFont.load_default()
+    # 화면 중앙에 두 줄로 표시 (PROJECT에서 줄바꿈), 글자마다 다른 색
+    line_height = 36
+    block_h = line_height * 2
+    y0 = (LCD_HEIGHT - block_h) // 2
+    draw_text_each_char_color(draw, 15, y0, "PORCUPINE", font_large, 0)
+    draw_text_each_char_color(draw, 15, y0 + line_height, "PROJECT", font_large, 9)
+    lcd_draw_image(spi, dc_pin, img)
+
 
 def lcd_update(spi, dc_pin: int) -> None:
     """shared_state 기준으로 LCD 화면 그리기"""
@@ -602,19 +658,18 @@ def lcd_update(spi, dc_pin: int) -> None:
         font_title = font_medium = font_small = ImageFont.load_default()
 
     y = 5
-    draw.text((10, y), "Porcupine", fill=(255, 255, 255), font=font_title)
+    draw_text_each_char_color(draw, 10, y, "Porcupine", font_title, 0)
     y += 24
-    draw.line([(5, y), (235, y)], fill=(100, 100, 100), width=1)
+    draw.line([(5, y), (235, y)], fill=(80, 80, 120), width=1)
     y += 8
 
-    colors = {"idle": (150, 150, 150), "recording": (255, 100, 100), "thinking": (255, 200, 100), "playing": (100, 255, 100), "error": (255, 50, 50)}
-    draw.text((10, y), f"Status: {status}", fill=colors.get(mode, (150, 150, 150)), font=font_medium)
+    draw_text_each_char_color(draw, 10, y, f"Status: {status}", font_medium, 2)
     y += 20
     display_text = (text[:28] + "..") if len(text) > 28 else text
-    draw.text((10, y), display_text, fill=(200, 200, 200), font=font_small)
+    draw_text_each_char_color(draw, 10, y, display_text, font_small, 5)
 
-    draw.line([(5, 300), (235, 300)], fill=(100, 100, 100), width=1)
-    draw.text((10, 305), "Porcupine say...", fill=(150, 150, 150), font=font_small)
+    draw.line([(5, 300), (235, 300)], fill=(80, 80, 120), width=1)
+    draw_text_each_char_color(draw, 10, 305, "Porcupine say...", font_small, 7)
 
     lcd_draw_image(spi, dc_pin, img)
 
@@ -665,6 +720,7 @@ def main() -> None:
             spi.mode = 0
             spi.max_speed_hz = 500000
             lcd_init_st7789v(spi, DC_PIN, RESET_PIN)
+            lcd_show_title(spi, DC_PIN)
             lcd_spi = spi
             log("LCD 초기화 완료.")
         except Exception as e:
