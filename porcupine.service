@@ -1,0 +1,17 @@
+[Unit]
+Description=Porcupine voice chatbot (WM8960 + LCD)
+After=multi-user.target sound.target
+
+[Service]
+Type=simple
+User=pi_ai
+WorkingDirectory=/home/pi_ai/Desktop/pi_ai
+ExecStart=/usr/bin/python3 /home/pi_ai/Desktop/pi_ai/porcupine/main.py
+Restart=on-failure
+RestartSec=10
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

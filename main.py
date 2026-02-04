@@ -63,7 +63,7 @@ TAVILY_API_KEY = load_api_key("tavily_API_key.txt", "tvly-...")
 PICOVOICE_KEY = load_api_key("picovoice_API_Key.txt", "...")
 
 # 키워드 인식 조정 (필요 시 수정)
-PORCUPINE_SENSITIVITY = 0.8    # 0~1, 제조사 권장 기본값 0.5 → 인식률 개선 위해 0.8
+PORCUPINE_SENSITIVITY = 0.5    # 0~1, 제조사 권장 기본값 (안정적인 기본값으로 되돌림)
 MIC_SOFTWARE_GAIN = 2.5        # 마이크 소프트웨어 증폭 (1.0=없음)
 # 녹음 전 버퍼 비우기 (이전 데이터가 다음 질문에 섞이는 것 방지)
 FLUSH_SEC_AFTER_TRIGGER = 0.25  # 트리거 후 버릴 시간(초). 짧을수록 대화 간격 단축
@@ -110,6 +110,7 @@ shared_state = {
     "audio_chunk": None,
     "manual_trigger": False,  # True면 키워드 없이 녹음 시작 (Enter 키)
     "cooldown_until": 0.0,    # 이 시간까지 Porcupine 무시 (TTS 에코 방지)
+    "prev_status": "IDLE",    # 직전 루프에서의 상태 (상태 전환 감지용)
 }
 
 LOG_FILE = os.path.join(PARENT_DIR, "jarvis.log")
@@ -168,10 +169,10 @@ def setup_wm8960_mixer(card_id: int) -> None:
     _amixer_set(card_id, "Left Boost Mixer LINPUT1", "on")
     _amixer_set(card_id, "Right Boost Mixer RINPUT1", "on")
 
-    # --- 캡처/마이크 감도 최대 (Porcupine 키워드 인식용) ---
+    # --- 캡처/마이크 감도 (약간만 여유 두고 조정) ---
     _amixer_set(card_id, "Capture", "100%")
-    _amixer_set(card_id, "Capture Volume", "90%")
-    _amixer_set(card_id, "ADC PCM Capture Volume", "80%")
+    _amixer_set(card_id, "Capture Volume", "85%")         # 90% → 85%
+    _amixer_set(card_id, "ADC PCM Capture Volume", "75%") # 80% → 75%
     # LINPUT1/RINPUT1 마이크 부스트 (범위 0~3, 3=최대)
     _amixer_set(card_id, "Left Input Boost Mixer LINPUT1 Volume", "3")
     _amixer_set(card_id, "Right Input Boost Mixer RINPUT1 Volume", "3")
@@ -235,7 +236,7 @@ def play_tts_wm8960(wav_or_mp3_path: str, card_id: Optional[int] = None) -> bool
 
 
 def _play_keyword_ack_and_start_listening() -> None:
-    """키워드 인식 시 '어, 인식했어' TTS 재생 후 LISTENING으로 전환 (별도 스레드에서 실행)"""
+    """키워드 인식 시 '어 말해봐' TTS 재생 후 LISTENING으로 전환 (단일 스레드 동기 실행)"""
     try:
         ack_path = os.path.join(PARENT_DIR, "keyword_ack.mp3")
         client.audio.speech.create(
@@ -347,7 +348,8 @@ def ai_worker(filename: str) -> None:
         shared_state["cooldown_until"] = time.time() + COOLDOWN_SEC_AFTER_RESPONSE
 
 # ==================== 오디오 루프 (WM8960 + Porcupine) ====================
-def audio_loop() -> None:
+def audio_loop(lcd_spi=None, dc_pin: int = 17) -> None:
+    """lcd_spi, dc_pin: LCD 갱신 시 사용 (None이면 LCD 미갱신). 새 스레드 생성 없이 메인 스레드에서만 갱신."""
     global WM8960_CARD_ID
     if PICOVOICE_KEY == "..." or len(PICOVOICE_KEY) < 20:
         log("❌ Picovoice API 키가 설정되지 않았습니다.")
@@ -406,7 +408,15 @@ def audio_loop() -> None:
             audio_raw = np.frombuffer(pcm, dtype=np.int16)
             shared_state["audio_chunk"] = audio_raw
 
-            if shared_state["status"] == "IDLE":
+            # 상태 전환 감지: IDLE로 새로 들어올 때 한 번만 로그 출력
+            status = shared_state["status"]
+            prev_status = shared_state.get("prev_status", status)
+            if status != prev_status:
+                if status == "IDLE":
+                    log("키워드 인식 대기 중... (Porcupine이라고 말해보세요)")
+                shared_state["prev_status"] = status
+
+            if status == "IDLE":
                 # 쿨다운 중이면 Porcupine 무시 (TTS 에코로 오인식 방지)
                 if time.time() < shared_state.get("cooldown_until", 0):
                     pass
@@ -425,16 +435,19 @@ def audio_loop() -> None:
                                 stream.read(porcupine.frame_length, exception_on_overflow=False)
                             except Exception:
                                 break
+                        # 키워드 확인 TTS를 메인 스레드에서 동기적으로 재생
                         shared_state["status"] = "ACK_PENDING"
                         shared_state["text"] = KEYWORD_ACK_PHRASE
                         frames = []
-                        threading.Thread(target=_play_keyword_ack_and_start_listening, daemon=True).start()
+                        _play_keyword_ack_and_start_listening()
+                        if lcd_spi is not None:
+                            lcd_show_listening(lcd_spi, dc_pin)
 
-            elif shared_state["status"] == "ACK_PENDING":
+            elif status == "ACK_PENDING":
                 # '어, 인식했어' 재생 중. 스트림만 소비하고, 재생 끝나면 스레드가 LISTENING으로 바꿈
                 pass
 
-            elif shared_state["status"] == "LISTENING":
+            elif status == "LISTENING":
                 # test_record.py와 동일: 원본만 저장 (증폭 없음)
                 frames.append(pcm)
                 raw = np.frombuffer(b"".join(frames), dtype=np.int16)
@@ -483,6 +496,8 @@ def audio_loop() -> None:
                         shared_state["text"] = "말씀이 없었습니다."
                         shared_state["cooldown_until"] = time.time() + COOLDOWN_SEC_AFTER_RESPONSE
                         frames = []
+                        if lcd_spi is not None:
+                            lcd_show_title(lcd_spi, dc_pin)
                     else:
                         log("✅ 녹음 완료 -> AI 처리 시작")
                         wav_path = os.path.join(PARENT_DIR, "input.wav")
@@ -491,9 +506,10 @@ def audio_loop() -> None:
                             wf.setsampwidth(2)
                             wf.setframerate(porcupine.sample_rate)
                             wf.writeframes(b"".join(frames))
-                        threading.Thread(target=ai_worker, args=(wav_path,), daemon=True).start()
-                        shared_state["status"] = "THINKING"
-                        shared_state["text"] = "처리 중..."
+                        # 단일 스레드로 STT + LLM + TTS를 순차 수행
+                        ai_worker(wav_path)
+                        if lcd_spi is not None:
+                            lcd_show_title(lcd_spi, dc_pin)
                     frames = []
         except Exception:
             pass
@@ -621,21 +637,39 @@ def lcd_draw_image(spi, dc_pin: int, img: Image.Image) -> None:
         spi.xfer(pixel_data[i : i + 4096])
 
 def lcd_show_title(spi, dc_pin: int) -> None:
-    """LCD에 'PORCUPINE' / 'PROJECT' 두 줄로 고정 표시 (초기화 직후용)"""
+    """LCD에 'PORCUPINE' / 'PROJECT' 두 줄 + 아래에 'Say Porcupine' 작은 글씨 (초기화 직후용)"""
     if not LCD_AVAILABLE or spi is None:
         return
     img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), color=(10, 10, 20))
     draw = ImageDraw.Draw(img)
     try:
         font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
     except Exception:
         font_large = ImageFont.load_default()
+        font_small = ImageFont.load_default()
     # 화면 중앙에 두 줄로 표시 (PROJECT에서 줄바꿈), 글자마다 다른 색
     line_height = 36
     block_h = line_height * 2
-    y0 = (LCD_HEIGHT - block_h) // 2
+    y0 = (LCD_HEIGHT - block_h) // 2 - 20
     draw_text_each_char_color(draw, 15, y0, "PORCUPINE", font_large, 0)
     draw_text_each_char_color(draw, 15, y0 + line_height, "PROJECT", font_large, 9)
+    # 그 아래 작은 글씨로 "Say Porcupine" 단색
+    draw.text((15, y0 + line_height * 2 + 14), "Say Porcupine", fill=(180, 180, 220), font=font_small)
+    lcd_draw_image(spi, dc_pin, img)
+
+
+def lcd_show_listening(spi, dc_pin: int) -> None:
+    """LCD 화면을 지우고 'Listening'만 표시 (키워드 인식 후 녹음 구간용, 메인 스레드에서만 호출)"""
+    if not LCD_AVAILABLE or spi is None:
+        return
+    img = Image.new("RGB", (LCD_WIDTH, LCD_HEIGHT), color=(10, 10, 20))
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
+    except Exception:
+        font = ImageFont.load_default()
+    draw.text((30, (LCD_HEIGHT - 40) // 2), "Listening", fill=(255, 255, 255), font=font)
     lcd_draw_image(spi, dc_pin, img)
 
 
@@ -734,7 +768,7 @@ def main() -> None:
         print("\n[안내] Porcupine 말하거나 Enter로 녹음.\n")
 
     try:
-        audio_loop()
+        audio_loop(lcd_spi=lcd_spi, dc_pin=DC_PIN)
     except KeyboardInterrupt:
         pass
     finally:
