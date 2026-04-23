@@ -12,6 +12,7 @@ import os
 import sys
 import json
 import math
+import re
 import time
 import wave
 import select
@@ -122,7 +123,14 @@ shared_state = {
 }
 
 LOG_FILE = os.path.join(PARENT_DIR, "jarvis.log")
+SHORT_TERM_MEMORY_FILE = os.path.join(PARENT_DIR, "conversation_memory.json")
+LONG_TERM_MEMORY_FILE = os.path.join(PARENT_DIR, "user_profile.json")
+MAX_RECENT_MESSAGES = 8
+KEEP_RECENT_MESSAGES = 4
+SUMMARY_MAX_CHARS = 1200
+PROFILE_NOTES_MAX = 8
 log_lock = threading.Lock()
+memory_lock = threading.Lock()
 
 def log(msg: str) -> None:
     print(f"\n[JARVIS] {msg}\n")
@@ -132,6 +140,239 @@ def log(msg: str) -> None:
                 f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
         except Exception:
             pass
+
+
+def _default_short_term_memory() -> dict:
+    return {"summary": "", "messages": []}
+
+
+def _default_long_term_memory() -> dict:
+    return {
+        "name": "",
+        "preferred_style": "반말",
+        "location": "",
+        "device_preferences": {},
+        "notes": [],
+    }
+
+
+def _load_json_file(path: str, default: dict) -> dict:
+    try:
+        if not os.path.exists(path):
+            return json.loads(json.dumps(default, ensure_ascii=False))
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            merged = json.loads(json.dumps(default, ensure_ascii=False))
+            merged.update(data)
+            return merged
+    except Exception as e:
+        log(f"⚠️ 메모리 파일 읽기 실패 ({os.path.basename(path)}): {e}")
+    return json.loads(json.dumps(default, ensure_ascii=False))
+
+
+def _save_json_file(path: str, data: dict) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log(f"⚠️ 메모리 파일 저장 실패 ({os.path.basename(path)}): {e}")
+
+
+def load_short_term_memory() -> dict:
+    with memory_lock:
+        memory = _load_json_file(SHORT_TERM_MEMORY_FILE, _default_short_term_memory())
+        messages = memory.get("messages", [])
+        if not isinstance(messages, list):
+            messages = []
+        memory["messages"] = [
+            {"role": m.get("role", ""), "content": (m.get("content") or "").strip()}
+            for m in messages
+            if isinstance(m, dict) and m.get("role") in ("user", "assistant") and (m.get("content") or "").strip()
+        ][-MAX_RECENT_MESSAGES:]
+        memory["summary"] = (memory.get("summary") or "").strip()[:SUMMARY_MAX_CHARS]
+        return memory
+
+
+def save_short_term_memory(memory: dict) -> None:
+    with memory_lock:
+        _save_json_file(SHORT_TERM_MEMORY_FILE, memory)
+
+
+def load_long_term_memory() -> dict:
+    with memory_lock:
+        memory = _load_json_file(LONG_TERM_MEMORY_FILE, _default_long_term_memory())
+        notes = memory.get("notes", [])
+        if not isinstance(notes, list):
+            notes = []
+        memory["notes"] = [str(note).strip() for note in notes if str(note).strip()][:PROFILE_NOTES_MAX]
+        device_preferences = memory.get("device_preferences", {})
+        memory["device_preferences"] = device_preferences if isinstance(device_preferences, dict) else {}
+        return memory
+
+
+def save_long_term_memory(memory: dict) -> None:
+    with memory_lock:
+        _save_json_file(LONG_TERM_MEMORY_FILE, memory)
+
+
+def summarize_conversation(existing_summary: str, messages_to_archive: List[dict]) -> str:
+    if not messages_to_archive:
+        return existing_summary[:SUMMARY_MAX_CHARS]
+
+    transcript_lines = []
+    for msg in messages_to_archive:
+        role = "사용자" if msg.get("role") == "user" else "Porcupine"
+        content = (msg.get("content") or "").strip()
+        if content:
+            transcript_lines.append(f"{role}: {content}")
+    transcript = "\n".join(transcript_lines)
+    if not transcript:
+        return existing_summary[:SUMMARY_MAX_CHARS]
+
+    try:
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "기존 요약과 새 대화를 합쳐 짧은 한국어 요약으로 다시 압축해. "
+                        "사실, 취향, 진행 중인 맥락만 남기고 군더더기는 버려. "
+                        f"{SUMMARY_MAX_CHARS}자 이내로 유지해."
+                    ),
+                },
+                {"role": "user", "content": f"기존 요약:\n{existing_summary or '(없음)'}\n\n새 대화:\n{transcript}"},
+            ],
+        )
+        summary = (res.choices[0].message.content or "").strip()
+        if summary:
+            return summary[:SUMMARY_MAX_CHARS]
+    except Exception as e:
+        log(f"⚠️ 대화 요약 실패, 축약 요약으로 대체: {e}")
+
+    fallback = " / ".join(line.split(": ", 1)[-1] for line in transcript_lines[-4:])
+    merged = f"{existing_summary} {fallback}".strip()
+    return merged[:SUMMARY_MAX_CHARS]
+
+
+def _extract_name(text: str) -> str:
+    patterns = [
+        r"내 이름은\s*([가-힣A-Za-z0-9]{2,20})",
+        r"내 이름\s*([가-힣A-Za-z0-9]{2,20})",
+        r"나는\s*([가-힣A-Za-z0-9]{2,20})(?:이야|야|예요|입니다)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _extract_location(text: str) -> str:
+    patterns = [
+        r"나는\s*([가-힣A-Za-z0-9\s]{2,20})에 살아",
+        r"저는\s*([가-힣A-Za-z0-9\s]{2,20})에 살아",
+        r"사는 곳은\s*([가-힣A-Za-z0-9\s]{2,20})",
+        r"지금\s*([가-힣A-Za-z0-9\s]{2,20})에 있어",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            return re.sub(r"\s+", " ", m.group(1).strip())
+    return ""
+
+
+def update_long_term_memory(user_text: str) -> dict:
+    profile = load_long_term_memory()
+    changed = False
+
+    name = _extract_name(user_text)
+    if name and profile.get("name") != name:
+        profile["name"] = name
+        changed = True
+
+    location = _extract_location(user_text)
+    if location and profile.get("location") != location:
+        profile["location"] = location
+        changed = True
+
+    if "존댓말" in user_text:
+        preferred = "존댓말"
+        if profile.get("preferred_style") != preferred:
+            profile["preferred_style"] = preferred
+            changed = True
+    elif "반말" in user_text:
+        preferred = "반말"
+        if profile.get("preferred_style") != preferred:
+            profile["preferred_style"] = preferred
+            changed = True
+
+    device_preferences = profile.get("device_preferences", {})
+    current_device_preferences = {
+        "microphone": "USB 마이크" if USE_USB_MIC else "WM8960 마이크",
+        "speaker": "WM8960",
+        "keyword_ack_phrase": KEYWORD_ACK_PHRASE,
+    }
+    if device_preferences != current_device_preferences:
+        profile["device_preferences"] = current_device_preferences
+        changed = True
+
+    if "키워드 응답음" in user_text and ("유지" in user_text or "필요" in user_text):
+        note = "사용자는 키워드 응답음을 유지하길 원한다."
+        notes = profile.get("notes", [])
+        if note not in notes:
+            profile["notes"] = (notes + [note])[-PROFILE_NOTES_MAX:]
+            changed = True
+
+    if changed:
+        save_long_term_memory(profile)
+    return profile
+
+
+def update_short_term_memory(user_text: str, assistant_text: str) -> None:
+    memory = load_short_term_memory()
+    messages = memory.get("messages", [])
+    messages.extend([
+        {"role": "user", "content": user_text.strip()},
+        {"role": "assistant", "content": assistant_text.strip()},
+    ])
+
+    if len(messages) > MAX_RECENT_MESSAGES:
+        archive_count = len(messages) - KEEP_RECENT_MESSAGES
+        memory["summary"] = summarize_conversation(memory.get("summary", ""), messages[:archive_count])
+        messages = messages[archive_count:]
+
+    memory["messages"] = messages[-MAX_RECENT_MESSAGES:]
+    save_short_term_memory(memory)
+
+
+def build_memory_context_messages(current_user_text: str) -> List[dict]:
+    short_term = load_short_term_memory()
+    long_term = update_long_term_memory(current_user_text)
+    context_messages: List[dict] = []
+
+    profile_parts = []
+    if long_term.get("name"):
+        profile_parts.append(f"사용자 이름: {long_term['name']}")
+    if long_term.get("preferred_style"):
+        profile_parts.append(f"선호 말투: {long_term['preferred_style']}")
+    if long_term.get("location"):
+        profile_parts.append(f"주요 위치: {long_term['location']}")
+    if long_term.get("device_preferences"):
+        profile_parts.append("기기 설정: " + json.dumps(long_term["device_preferences"], ensure_ascii=False))
+    if long_term.get("notes"):
+        profile_parts.append("중요 메모: " + " / ".join(long_term["notes"]))
+    if profile_parts:
+        context_messages.append({"role": "system", "content": "장기 메모리:\n" + "\n".join(profile_parts)})
+
+    if short_term.get("summary"):
+        context_messages.append({"role": "system", "content": "이전 대화 요약:\n" + short_term["summary"]})
+
+    for msg in short_term.get("messages", []):
+        context_messages.append({"role": msg["role"], "content": msg["content"]})
+
+    return context_messages
 
 # ==================== WM8960 (SpeakerLCDTest 참조) ====================
 def get_wm8960_card() -> Optional[int]:
@@ -345,6 +586,8 @@ WM8960_CARD_ID: Optional[int] = None  # audio_loop에서 설정 후 ai_worker에
 
 def ai_worker(filename: str) -> None:
     global WM8960_CARD_ID
+    txt = ""
+    reply = ""
     try:
         log("📝 [1/4] STT 시작...")
         shared_state["text"] = "듣고 있어요..."
@@ -360,9 +603,16 @@ def ai_worker(filename: str) -> None:
         shared_state["text"] = f"🤔 {txt}"
         shared_state["status"] = "THINKING"
         msgs = [
-            {"role": "system", "content": "너는 포큐파인(Porcupine)이야. 친구처럼 반말하고 짧게 대답해."},
-            {"role": "user", "content": txt},
+            {
+                "role": "system",
+                "content": (
+                    "너는 포큐파인(Porcupine)이야. 짧고 자연스럽게 대답해. "
+                    "기본은 친근한 반말이지만, 장기 메모리에 말투 선호가 있으면 그걸 우선해."
+                ),
+            },
         ]
+        msgs.extend(build_memory_context_messages(txt))
+        msgs.append({"role": "user", "content": txt})
         res = client.chat.completions.create(model="gpt-4o", messages=msgs, tools=tools)
         msg = res.choices[0].message
 
@@ -412,6 +662,8 @@ def ai_worker(filename: str) -> None:
         log(f"❌ AI Error: {e}")
         shared_state["text"] = f"오류: {str(e)[:50]}"
     finally:
+        if txt.strip() and reply.strip():
+            update_short_term_memory(txt, reply)
         shared_state["status"] = "IDLE"
         shared_state["text"] = "Porcupine 대기 중..."
         shared_state["cooldown_until"] = time.time() + COOLDOWN_SEC_AFTER_RESPONSE
