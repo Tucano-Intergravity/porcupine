@@ -64,7 +64,7 @@ TAVILY_API_KEY = load_api_key("tavily_API_key.txt", "tvly-...")
 PICOVOICE_KEY = load_api_key("picovoice_API_Key.txt", "...")
 
 # 키워드 인식 조정 (필요 시 수정)
-PORCUPINE_SENSITIVITY = 1.0    # 0~1, 키워드 인식률 확인을 위해 최대 감도로 설정
+PORCUPINE_SENSITIVITY = 0.55   # 0~1, 오인식을 줄이기 위해 감도를 낮춤
 MIC_SOFTWARE_GAIN = 2.5        # 마이크 소프트웨어 증폭 (과도한 증폭 왜곡을 줄이기 위해 완화)
 # 음성 입력: True면 USB 마이크(48kHz 스테레오 → 16kHz 모노 변환), False면 WM8960 마이크
 USE_USB_MIC = True
@@ -80,6 +80,8 @@ VAD_CHUNK_SEC = 0.2               # 에너지 계산 구간(초)
 VAD_THRESHOLD = 900               # 구간 평균 에너지가 이 값 넘으면 '말 있음' (0~32768)
 # 키워드 인식 시 음성으로 응답할 문장 (TTS 재생 후 녹음 시작)
 KEYWORD_ACK_PHRASE = "어 말해봐"
+TTS_MODEL = "gpt-4o-mini-tts"
+TTS_VOICE = "nova"
 # 노이즈를 음성으로 인식하지 않도록 (0~32768). 낮출수록 작은 소리도 인식(감도 up)
 MIN_RECORD_LEVEL = 700            # 전체 평균 레벨이 이 값 미만이면 STT 건너뜀 (WM8960)
 CHUNK_SEC = 0.5                   # 말 구간 판단용 구간 길이(초)
@@ -406,9 +408,9 @@ def setup_wm8960_mixer(card_id: int) -> None:
     _amixer_set(card_id, "Mono Output Mixer Left", "on")
     _amixer_set(card_id, "Mono Output Mixer Right", "on")
 
-    # --- 재생 볼륨 (스피커 90%) ---
-    _amixer_set(card_id, "Speaker", "90%")
-    _amixer_set(card_id, "Speaker Playback Volume", "90%")
+    # --- 재생 볼륨 (스피커 최대) ---
+    _amixer_set(card_id, "Speaker", "100%")
+    _amixer_set(card_id, "Speaker Playback Volume", "100%")
     _amixer_set(card_id, "Headphone", "100%")
     _amixer_set(card_id, "Headphone Playback Volume", "100%")
     _amixer_set(card_id, "Playback", "100%")
@@ -538,7 +540,7 @@ def _play_keyword_ack_and_start_listening() -> None:
         # WAV로 요청해 aplay -D plughw:N,0 로 WM8960에 확실히 출력
         ack_path = os.path.join(PARENT_DIR, "keyword_ack.wav")
         resp = client.audio.speech.create(
-            model="tts-1", voice="alloy", input=KEYWORD_ACK_PHRASE,
+            model=TTS_MODEL, voice=TTS_VOICE, input=KEYWORD_ACK_PHRASE,
             response_format="wav"
         )
         with open(ack_path, "wb") as f:
@@ -648,7 +650,7 @@ def ai_worker(filename: str) -> None:
         log("🔊 [3/4] TTS 생성...")
         tts_file = os.path.join(PARENT_DIR, "tts_output.wav")
         resp = client.audio.speech.create(
-            model="tts-1", voice="alloy", input=reply,
+            model=TTS_MODEL, voice=TTS_VOICE, input=reply,
             response_format="wav"
         )
         with open(tts_file, "wb") as f:
