@@ -63,14 +63,14 @@ TAVILY_API_KEY = load_api_key("tavily_API_key.txt", "tvly-...")
 PICOVOICE_KEY = load_api_key("picovoice_API_Key.txt", "...")
 
 # 키워드 인식 조정 (필요 시 수정)
-PORCUPINE_SENSITIVITY = 0.5    # 0~1, 제조사 권장 기본값 (안정적인 기본값으로 되돌림)
-MIC_SOFTWARE_GAIN = 4.0        # 마이크 소프트웨어 증폭 (1.0=없음, 높을수록 감도 up)
+PORCUPINE_SENSITIVITY = 1.0    # 0~1, 키워드 인식률 확인을 위해 최대 감도로 설정
+MIC_SOFTWARE_GAIN = 2.5        # 마이크 소프트웨어 증폭 (과도한 증폭 왜곡을 줄이기 위해 완화)
 # 음성 입력: True면 USB 마이크(48kHz 스테레오 → 16kHz 모노 변환), False면 WM8960 마이크
 USE_USB_MIC = True
 USB_MIC_NAME_KEYWORDS = ["earpods", "usb audio"]  # PyAudio 디바이스 이름에 포함되면 USB 마이크로 인식
 # 녹음 전 버퍼 비우기 (이전 데이터가 다음 질문에 섞이는 것 방지)
 FLUSH_SEC_AFTER_TRIGGER = 0.25  # 트리거 후 버릴 시간(초). 짧을수록 대화 간격 단축
-COOLDOWN_SEC_AFTER_RESPONSE = 0.5  # 응답 끝난 뒤 Porcupine 무시 시간(초). 짧을수록 다음 호출 빠름
+COOLDOWN_SEC_AFTER_RESPONSE = 1.5  # 응답 끝난 뒤 Porcupine 무시 시간(초). 잔향/AGC 안정화를 위해 여유 증가
 RECORD_SEC = 3  # (VAD 미사용 시) 고정 녹음 길이(초). VAD 사용 시에는 참고만
 # VAD (에너지 기반): 침묵이면 녹음 중지
 MAX_RECORD_SEC = 15              # 최대 질문 길이(초)
@@ -226,8 +226,11 @@ def _convert_48k_stereo_to_16k_mono(pcm_bytes: bytes) -> np.ndarray:
     n_frames = len(raw) // 2
     stereo = raw.reshape(n_frames, 2)
     mono_48k = (stereo[:, 0].astype(np.int32) + stereo[:, 1].astype(np.int32)) // 2
-    # 48k -> 16k: 1/3 샘플만 취함 (decimation by 3)
-    mono_16k = mono_48k[::3].astype(np.int16)
+    usable = (len(mono_48k) // 3) * 3
+    if usable == 0:
+        return np.zeros(0, dtype=np.int16)
+    # 48k -> 16k: 단순 샘플 버리기 대신 3샘플 평균으로 다운샘플링해 aliasing을 줄임
+    mono_16k = mono_48k[:usable].reshape(-1, 3).mean(axis=1).astype(np.int16)
     return mono_16k
 
 
@@ -436,13 +439,15 @@ def audio_loop(lcd_spi=None, dc_pin: int = 17) -> None:
         mic_index = 0
 
     # 입력 장치: USE_USB_MIC=True면 USB 마이크만 사용 (WM8960 마이크 미사용)
+    using_usb_mic = False
     if USE_USB_MIC:
         usb_idx = get_usb_mic_pyaudio_index()
         if usb_idx is not None:
+            using_usb_mic = True
             input_device_index = usb_idx
-            input_rate = 48000
-            input_channels = 2
-            log("음성 입력: USB 마이크 (PyAudio index=%s) / 48kHz 스테레오 → 16kHz 모노 변환, WM8960 마이크 미사용" % usb_idx)
+            input_rate = 16000
+            input_channels = 1
+            log("음성 입력: USB 마이크 (PyAudio index=%s) / 16kHz 모노 직접 입력 우선 시도, 실패 시 48kHz 스테레오로 대체" % usb_idx)
         else:
             log("❌ USE_USB_MIC=True인데 USB 마이크를 찾지 못함. USB 마이크를 연결하거나 USE_USB_MIC=False로 설정하세요.")
             shared_state["text"] = "USB 마이크를 찾을 수 없습니다"
@@ -455,6 +460,7 @@ def audio_loop(lcd_spi=None, dc_pin: int = 17) -> None:
 
     def init_audio_stack():
         """Porcupine 엔진 + PyAudio 스트림을 새로 초기화. 반환: (porcupine, pa, stream, input_rate, input_channels)"""
+        nonlocal input_rate, input_channels
         try:
             porcupine_local = pvporcupine.create(
                 access_key=PICOVOICE_KEY,
@@ -468,16 +474,32 @@ def audio_loop(lcd_spi=None, dc_pin: int = 17) -> None:
 
         pa_local = pyaudio.PyAudio()
         try:
-            if input_rate == 48000 and input_channels == 2:
-                # USB 마이크: 48kHz 스테레오, 1536프레임/읽기 → 512샘플(16k)로 변환해 Porcupine에 전달
-                stream_local = pa_local.open(
-                    rate=48000,
-                    channels=2,
-                    format=pyaudio.paInt16,
-                    input=True,
-                    frames_per_buffer=1536,
-                    input_device_index=input_device_index,
-                )
+            if using_usb_mic:
+                try:
+                    stream_local = pa_local.open(
+                        rate=16000,
+                        channels=1,
+                        format=pyaudio.paInt16,
+                        input=True,
+                        frames_per_buffer=porcupine_local.frame_length,
+                        input_device_index=input_device_index,
+                    )
+                    input_rate = 16000
+                    input_channels = 1
+                    log("USB 마이크를 16kHz 모노로 직접 열었습니다. (Porcupine 권장 경로)")
+                except Exception as usb_16k_error:
+                    log(f"USB 마이크 16kHz 모노 직접 열기 실패: {usb_16k_error}")
+                    stream_local = pa_local.open(
+                        rate=48000,
+                        channels=2,
+                        format=pyaudio.paInt16,
+                        input=True,
+                        frames_per_buffer=1536,
+                        input_device_index=input_device_index,
+                    )
+                    input_rate = 48000
+                    input_channels = 2
+                    log("USB 마이크를 48kHz 스테레오로 열었습니다. 16kHz 모노로 변환해서 사용합니다.")
             else:
                 stream_local = pa_local.open(
                     rate=porcupine_local.sample_rate,
@@ -550,8 +572,11 @@ def audio_loop(lcd_spi=None, dc_pin: int = 17) -> None:
             if status != prev_status:
                 if status == "IDLE":
                     log("키워드 인식 대기 중... (Porcupine이라고 말해보세요)")
-                elif status == "LISTENING" and input_rate == 48000 and input_channels == 2:
-                    log("질문 녹음 시작 (USB 마이크 사용 중)")
+                elif status == "LISTENING":
+                    if using_usb_mic and input_rate == 16000 and input_channels == 1:
+                        log("질문 녹음 시작 (USB 마이크 16kHz 모노 직접 입력)")
+                    elif using_usb_mic and input_rate == 48000 and input_channels == 2:
+                        log("질문 녹음 시작 (USB 마이크 48kHz 스테레오 입력)")
                 shared_state["prev_status"] = status
 
             if status == "IDLE":
@@ -585,9 +610,6 @@ def audio_loop(lcd_spi=None, dc_pin: int = 17) -> None:
                         shared_state["status"] = "ACK_PENDING"
                         shared_state["text"] = KEYWORD_ACK_PHRASE
                         frames = []
-                        # 질문 듣기(LISTENING) 구간에 진입하기 전에 LCD를 먼저 Listening 화면으로 전환
-                        if lcd_spi is not None:
-                            lcd_show_listening(lcd_spi, dc_pin)
                         _play_keyword_ack_and_start_listening()
 
             elif status == "ACK_PENDING":
@@ -615,7 +637,7 @@ def audio_loop(lcd_spi=None, dc_pin: int = 17) -> None:
                     samples_per_vad_chunk = int(porcupine.sample_rate * VAD_CHUNK_SEC)
                     silence_chunks_required = int(VAD_SILENCE_SEC / VAD_CHUNK_SEC)
                     last_checked = shared_state.get("vad_last_checked", 0)
-                    vad_thresh = VAD_THRESHOLD_USB if (input_rate == 48000 and input_channels == 2) else VAD_THRESHOLD
+                    vad_thresh = VAD_THRESHOLD_USB if using_usb_mic else VAD_THRESHOLD
                     while last_checked + samples_per_vad_chunk <= total_samples:
                         chunk = raw[last_checked : last_checked + samples_per_vad_chunk]
                         energy = np.abs(chunk).mean()
@@ -641,9 +663,9 @@ def audio_loop(lcd_spi=None, dc_pin: int = 17) -> None:
                     samples_per_chunk = int(porcupine.sample_rate * CHUNK_SEC)
                     n_chunks = max(1, len(raw) // samples_per_chunk)
                     chunks_above = 0
-                    chunk_thresh = CHUNK_LEVEL_THRESHOLD_USB if (input_rate == 48000 and input_channels == 2) else CHUNK_LEVEL_THRESHOLD
-                    min_level = MIN_RECORD_LEVEL_USB if (input_rate == 48000 and input_channels == 2) else MIN_RECORD_LEVEL
-                    min_chunks = MIN_CHUNKS_ABOVE_LEVEL_USB if (input_rate == 48000 and input_channels == 2) else MIN_CHUNKS_ABOVE_LEVEL
+                    chunk_thresh = CHUNK_LEVEL_THRESHOLD_USB if using_usb_mic else CHUNK_LEVEL_THRESHOLD
+                    min_level = MIN_RECORD_LEVEL_USB if using_usb_mic else MIN_RECORD_LEVEL
+                    min_chunks = MIN_CHUNKS_ABOVE_LEVEL_USB if using_usb_mic else MIN_CHUNKS_ABOVE_LEVEL
                     for i in range(n_chunks):
                         start = i * samples_per_chunk
                         end = min(start + samples_per_chunk, len(raw))
@@ -655,8 +677,6 @@ def audio_loop(lcd_spi=None, dc_pin: int = 17) -> None:
                         shared_state["text"] = "말씀이 없었습니다."
                         shared_state["cooldown_until"] = time.time() + COOLDOWN_SEC_AFTER_RESPONSE
                         frames = []
-                        if lcd_spi is not None:
-                            lcd_show_title(lcd_spi, dc_pin)
                     else:
                         log("✅ 녹음 완료 -> AI 처리 시작")
                         wav_path = os.path.join(PARENT_DIR, "input.wav")
@@ -672,10 +692,6 @@ def audio_loop(lcd_spi=None, dc_pin: int = 17) -> None:
                                 wf.writeframes(b"".join(frames))
                         # 단일 스레드로 STT + LLM + TTS를 순차 수행
                         ai_worker(wav_path)
-                        if lcd_spi is not None:
-                            lcd_show_title(lcd_spi, dc_pin)
-                        # 질문 한 턴이 끝났으므로 오디오 스택 전체 재초기화
-                        reset_audio_stack()
                     frames = []
         except Exception:
             pass
