@@ -127,10 +127,25 @@ shared_state = {
 LOG_FILE = os.path.join(PARENT_DIR, "jarvis.log")
 SHORT_TERM_MEMORY_FILE = os.path.join(PARENT_DIR, "conversation_memory.json")
 LONG_TERM_MEMORY_FILE = os.path.join(PARENT_DIR, "user_profile.json")
+IMPORTANT_CONTEXT_FILE = os.environ.get(
+    "PORCUPINE_IMPORTANT_CONTEXT",
+    os.path.join(SCRIPT_DIR, "important_context.md"),
+)
+IMPORTANT_CONTEXT_MAX_CHARS = 2500
 MAX_RECENT_MESSAGES = 8
 KEEP_RECENT_MESSAGES = 4
 SUMMARY_MAX_CHARS = 1200
 PROFILE_NOTES_MAX = 8
+INVALID_MEMORY_VALUES = {"누구", "누구야", "뭐", "뭐야", "어디", "어디야", "언제", "몰라"}
+VOLUME_STEP_PERCENT = 5
+OUTPUT_VOLUME_CONTROLS = (
+    "Speaker",
+    "Speaker Playback Volume",
+    "Headphone",
+    "Headphone Playback Volume",
+    "Playback",
+    "Playback Volume",
+)
 log_lock = threading.Lock()
 memory_lock = threading.Lock()
 
@@ -181,6 +196,46 @@ def _save_json_file(path: str, data: dict) -> None:
         log(f"⚠️ 메모리 파일 저장 실패 ({os.path.basename(path)}): {e}")
 
 
+def load_important_context() -> str:
+    """사전에 정리한 고정 참고사항을 로드한다. 없으면 조용히 건너뛴다."""
+    try:
+        if not os.path.exists(IMPORTANT_CONTEXT_FILE):
+            return ""
+        with open(IMPORTANT_CONTEXT_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()[:IMPORTANT_CONTEXT_MAX_CHARS]
+    except Exception as e:
+        log(f"⚠️ 중요 참고사항 읽기 실패 ({os.path.basename(IMPORTANT_CONTEXT_FILE)}): {e}")
+        return ""
+
+
+def build_runtime_context_message() -> dict:
+    now = datetime.now().astimezone()
+    return {
+        "role": "system",
+        "content": (
+            "현재 실행 환경 정보:\n"
+            f"- 현재 날짜/시간: {now.strftime('%Y-%m-%d %H:%M:%S')} {now.strftime('%Z')}\n"
+            f"- 현재 연도: {now.year}년\n"
+            "- 사용자가 '올해', '지금', '오늘'처럼 현재 시점이 필요한 질문을 하면 이 날짜/시간을 우선해.\n"
+            "- 이전 대화나 오래된 메모리에 다른 연도/날짜가 있어도 현재 시점은 이 메시지를 따른다."
+        ),
+    }
+
+
+def build_important_context_message() -> Optional[dict]:
+    context = load_important_context()
+    if not context:
+        return None
+    return {
+        "role": "system",
+        "content": (
+            "사전에 정리된 중요 참고사항:\n"
+            f"{context}\n\n"
+            "위 참고사항은 오래된 대화 요약보다 우선한다. 단, 현재 날짜/시간은 별도 실행 환경 정보가 우선한다."
+        ),
+    }
+
+
 def load_short_term_memory() -> dict:
     with memory_lock:
         memory = _load_json_file(SHORT_TERM_MEMORY_FILE, _default_short_term_memory())
@@ -204,6 +259,9 @@ def save_short_term_memory(memory: dict) -> None:
 def load_long_term_memory() -> dict:
     with memory_lock:
         memory = _load_json_file(LONG_TERM_MEMORY_FILE, _default_long_term_memory())
+        for key in ("name", "location"):
+            value = str(memory.get(key, "")).strip()
+            memory[key] = "" if value in INVALID_MEMORY_VALUES else value
         notes = memory.get("notes", [])
         if not isinstance(notes, list):
             notes = []
@@ -267,7 +325,8 @@ def _extract_name(text: str) -> str:
     for pattern in patterns:
         m = re.search(pattern, text)
         if m:
-            return m.group(1).strip()
+            value = m.group(1).strip()
+            return "" if value in INVALID_MEMORY_VALUES else value
     return ""
 
 
@@ -281,7 +340,8 @@ def _extract_location(text: str) -> str:
     for pattern in patterns:
         m = re.search(pattern, text)
         if m:
-            return re.sub(r"\s+", " ", m.group(1).strip())
+            value = re.sub(r"\s+", " ", m.group(1).strip())
+            return "" if value in INVALID_MEMORY_VALUES else value
     return ""
 
 
@@ -399,6 +459,70 @@ def _amixer_set(card_id: int, name: str, value: str) -> bool:
     return r.returncode == 0
 
 
+def _amixer_get_percent(card_id: int, name: str = "Speaker") -> Optional[int]:
+    """amixer 컨트롤의 첫 번째 퍼센트 값을 읽는다."""
+    try:
+        r = subprocess.run(
+            ["amixer", "-c", str(card_id), "sget", name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode != 0:
+            return None
+        m = re.search(r"\[(\d{1,3})%\]", r.stdout)
+        if not m:
+            return None
+        return max(0, min(100, int(m.group(1))))
+    except Exception:
+        return None
+
+
+def set_output_volume_percent(card_id: int, percent: int) -> int:
+    """WM8960 출력 관련 믹서들을 같은 퍼센트로 맞춘다."""
+    percent = max(0, min(100, int(percent)))
+    for control in OUTPUT_VOLUME_CONTROLS:
+        _amixer_set(card_id, control, f"{percent}%")
+    return percent
+
+
+def handle_local_voice_command(text: str) -> Optional[str]:
+    """LLM을 거치지 않아도 되는 장치 제어 음성 명령 처리."""
+    if WM8960_CARD_ID is None:
+        return None
+
+    compact = re.sub(r"\s+", "", text.lower())
+    if not any(word in compact for word in ("볼륨", "음량", "소리")):
+        return None
+
+    increase_words = ("높여", "올려", "키워", "크게", "높게", "업", "증가")
+    decrease_words = ("낮춰", "내려", "줄여", "작게", "다운", "감소")
+
+    direction = 0
+    if any(word in compact for word in increase_words):
+        direction = 1
+    elif any(word in compact for word in decrease_words):
+        direction = -1
+    elif "최대" in compact:
+        current = _amixer_get_percent(WM8960_CARD_ID)
+        new_percent = set_output_volume_percent(WM8960_CARD_ID, 100)
+        return f"볼륨을 {current or new_percent}%에서 {new_percent}%로 올렸어."
+    elif any(word in compact for word in ("음소거", "무음", "최소")):
+        current = _amixer_get_percent(WM8960_CARD_ID)
+        new_percent = set_output_volume_percent(WM8960_CARD_ID, 0)
+        return f"볼륨을 {current or new_percent}%에서 {new_percent}%로 낮췄어."
+    else:
+        return None
+
+    current = _amixer_get_percent(WM8960_CARD_ID)
+    if current is None:
+        return "지금 볼륨 값을 읽지 못했어."
+
+    new_percent = set_output_volume_percent(WM8960_CARD_ID, current + (direction * VOLUME_STEP_PERCENT))
+    action = "올렸어" if direction > 0 else "낮췄어"
+    return f"볼륨을 {current}%에서 {new_percent}%로 {action}."
+
+
 def setup_wm8960_mixer(card_id: int) -> None:
     """WM8960 믹서/경로 설정 + 재생·마이크 감도 최대"""
     c = str(card_id)
@@ -409,12 +533,7 @@ def setup_wm8960_mixer(card_id: int) -> None:
     _amixer_set(card_id, "Mono Output Mixer Right", "on")
 
     # --- 재생 볼륨 (스피커 최대) ---
-    _amixer_set(card_id, "Speaker", "100%")
-    _amixer_set(card_id, "Speaker Playback Volume", "100%")
-    _amixer_set(card_id, "Headphone", "100%")
-    _amixer_set(card_id, "Headphone Playback Volume", "100%")
-    _amixer_set(card_id, "Playback", "100%")
-    _amixer_set(card_id, "Playback Volume", "100%")
+    set_output_volume_percent(card_id, 100)
 
     # --- 마이크 입력 경로 ---
     _amixer_set(card_id, "Left Boost Mixer LINPUT1", "on")
@@ -601,49 +720,58 @@ def ai_worker(filename: str) -> None:
             shared_state["text"] = "음성을 인식하지 못했습니다."
             return
 
-        log("🤔 [2/4] LLM 처리 시작...")
-        shared_state["text"] = f"🤔 {txt}"
-        shared_state["status"] = "THINKING"
-        msgs = [
-            {
-                "role": "system",
-                "content": (
-                    "너는 포큐파인(Porcupine)이야. 짧고 자연스럽게 대답해. "
-                    "기본은 친근한 반말이지만, 장기 메모리에 말투 선호가 있으면 그걸 우선해."
-                ),
-            },
-        ]
-        msgs.extend(build_memory_context_messages(txt))
-        msgs.append({"role": "user", "content": txt})
-        res = client.chat.completions.create(model="gpt-4o", messages=msgs, tools=tools)
-        msg = res.choices[0].message
-
-        if msg.tool_calls:
-            shared_state["text"] = "🌐 검색 중..."
-            # assistant 메시지는 한 번만 추가 (tool_calls 포함)
-            assistant_msg = {
-                "role": "assistant",
-                "content": msg.content or None,
-                "tool_calls": [
-                    {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                    for tc in msg.tool_calls
-                ],
-            }
-            msgs.append(assistant_msg)
-            # 각 tool_call_id에 대해 tool 메시지를 순서대로 추가 (전부 있어야 API 오류 없음)
-            for tc in msg.tool_calls:
-                if getattr(tc.function, "name", None) == "web_search":
-                    arg = json.loads(tc.function.arguments or "{}")
-                    search_res = web_search(arg.get("query", ""))
-                else:
-                    search_res = json.dumps({"error": "unknown tool"})
-                msgs.append({"role": "tool", "tool_call_id": tc.id, "name": tc.function.name, "content": search_res})
-            final = client.chat.completions.create(model="gpt-4o", messages=msgs)
-            reply = final.choices[0].message.content or ""
+        local_reply = handle_local_voice_command(txt)
+        if local_reply:
+            reply = local_reply
+            log(f"⚙️ [2/4] 로컬 명령 처리 완료 - Porcupine: {reply}")
         else:
-            reply = msg.content
+            log("🤔 [2/4] LLM 처리 시작...")
+            shared_state["text"] = f"🤔 {txt}"
+            shared_state["status"] = "THINKING"
+            msgs = [
+                {
+                    "role": "system",
+                    "content": (
+                        "너는 포큐파인(Porcupine)이야. 짧고 자연스럽게 대답해. "
+                        "기본은 친근한 반말이지만, 장기 메모리에 말투 선호가 있으면 그걸 우선해."
+                    ),
+                },
+            ]
+            msgs.extend(build_memory_context_messages(txt))
+            important_context_msg = build_important_context_message()
+            if important_context_msg:
+                msgs.append(important_context_msg)
+            msgs.append(build_runtime_context_message())
+            msgs.append({"role": "user", "content": txt})
+            res = client.chat.completions.create(model="gpt-4o", messages=msgs, tools=tools)
+            msg = res.choices[0].message
 
-        log(f"🤖 [2/4] LLM 완료 - Porcupine: {reply}")
+            if msg.tool_calls:
+                shared_state["text"] = "🌐 검색 중..."
+                # assistant 메시지는 한 번만 추가 (tool_calls 포함)
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": msg.content or None,
+                    "tool_calls": [
+                        {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                        for tc in msg.tool_calls
+                    ],
+                }
+                msgs.append(assistant_msg)
+                # 각 tool_call_id에 대해 tool 메시지를 순서대로 추가 (전부 있어야 API 오류 없음)
+                for tc in msg.tool_calls:
+                    if getattr(tc.function, "name", None) == "web_search":
+                        arg = json.loads(tc.function.arguments or "{}")
+                        search_res = web_search(arg.get("query", ""))
+                    else:
+                        search_res = json.dumps({"error": "unknown tool"})
+                    msgs.append({"role": "tool", "tool_call_id": tc.id, "name": tc.function.name, "content": search_res})
+                final = client.chat.completions.create(model="gpt-4o", messages=msgs)
+                reply = final.choices[0].message.content or ""
+            else:
+                reply = msg.content
+
+            log(f"🤖 [2/4] LLM 완료 - Porcupine: {reply}")
         shared_state["text"] = reply
         shared_state["status"] = "SPEAKING"
 
